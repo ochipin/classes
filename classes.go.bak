@@ -1,0 +1,187 @@
+package classes
+
+import (
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"strings"
+)
+
+// FuncType : 関数情報
+type FuncType struct {
+	FuncName  string                // 関数名
+	RecvName  string                // レシーバ名
+	RecvType  string                // レシーバ型
+	Arguments []map[string][]string // 引数
+	Returns   []map[string][]string // 復帰値
+	Exported  bool                  // エクスポート
+}
+
+func (f *FuncType) String() string {
+	var args string
+	var rets string
+
+	// 引数が設定されている場合
+	if len(f.Arguments) > 0 {
+		var strs []string
+		// []map["int"][]string{"a", "b", "c"}
+		for _, arg := range f.Arguments {
+			for name, vals := range arg {
+				// [a b c] => "a, b, c int"
+				arginfo := strings.Join(vals, ", ") + " " + name
+				strs = append(strs, arginfo)
+			}
+		}
+		args = strings.Join(strs, ", ")
+	}
+
+	// 復帰値が設定されている場合
+	if len(f.Returns) > 0 {
+		var strs []string
+		var flag bool
+		// []map["string"][]string{"str"}
+		for _, ret := range f.Returns {
+			for typ, names := range ret {
+				var retinfo string
+				if len(names) > 0 {
+					retinfo = strings.Join(names, ", ") + " " + typ
+					flag = true
+				} else {
+					retinfo = typ
+				}
+				strs = append(strs, retinfo)
+			}
+		}
+		rets = strings.Join(strs, ", ")
+		if flag || len(f.Returns) > 1 {
+			rets = "(" + rets + ")"
+		}
+	}
+
+	return fmt.Sprintf("func (%s %s) %s(%s) %s",
+		f.RecvName, f.RecvType, f.FuncName, args, rets)
+}
+
+// New : Classes 構造体を生成する
+func New(dirname string) *Classes {
+	return &Classes{
+		Dirname:    dirname,
+		Func:       func(f os.FileInfo) bool { return true },
+		Mode:       0644,
+		ExportOnly: true,
+	}
+}
+
+// Classes : ソースコード内で定義されている構造体名一覧を取得する構造体
+type Classes struct {
+	Dirname    string
+	Func       func(os.FileInfo) bool
+	Mode       parser.Mode
+	ExportOnly bool
+	fset       *token.FileSet
+}
+
+// Classlist : 構造体一覧を返却する
+func (class *Classes) Classlist() ([]string, error) {
+	var clsnames []string
+
+	class.fset = token.NewFileSet()
+	pkgs, err := parser.ParseDir(class.fset, class.Dirname, class.Func, class.Mode)
+	if err != nil {
+		return nil, err
+	}
+
+	// app.go, base.go, ... などのパッケージ内のソースをすべて網羅する
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Files {
+			// ソースコード上で定義されている構造体一覧を取得
+			result := class.analyze(file)
+			// 構造体一覧を結合
+			if result != nil {
+				clsnames = append(clsnames, result...)
+			}
+		}
+	}
+
+	// 構造体一覧を返却する
+	return clsnames, nil
+}
+
+func (class *Classes) analyze(file *ast.File) []string {
+	var result []string
+
+	for _, decl := range file.Decls {
+		switch td := decl.(type) {
+		// 構造体の場合
+		case *ast.GenDecl:
+			if td.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range td.Specs {
+				name := class.spec(spec)
+				if name != "" {
+					result = append(result, name)
+				}
+			}
+		// 関数の場合
+		case *ast.FuncDecl:
+			// エクスポート対象ではない関数は非対象とする。また、レシーバを持たない関数は除外する
+			if class.ExportOnly && td.Name.IsExported() == false || td.Recv == nil {
+				continue
+			}
+
+			f := &FuncType{
+				FuncName: td.Name.String(),
+				RecvType: fmt.Sprint(td.Recv.List[0].Type),
+			}
+
+			// レシーバ名を設定
+			if len(td.Recv.List[0].Names) > 0 {
+				f.RecvName = fmt.Sprint(td.Recv.List[0].Names[0])
+			}
+
+			// 引数を設定
+			if td.Type.Params != nil && td.Type.Params.NumFields() > 0 {
+				for _, p := range td.Type.Params.List {
+					var args = make(map[string][]string)
+					var typ = fmt.Sprint(p.Type)
+					args[typ] = []string{}
+					f.Arguments = append(f.Arguments, args)
+					for _, n := range p.Names {
+						args[typ] = append(args[typ], fmt.Sprint(n))
+					}
+				}
+			}
+
+			// 復帰値を設定
+			if td.Type.Results != nil && td.Type.Results.NumFields() > 0 {
+				for _, r := range td.Type.Results.List {
+					var args = make(map[string][]string)
+					var typ = fmt.Sprint(r.Type)
+					args[typ] = []string{}
+					f.Returns = append(f.Returns, args)
+					for _, n := range r.Names {
+						args[typ] = append(args[typ], fmt.Sprint(n))
+					}
+				}
+			}
+		}
+	}
+	return result
+}
+
+func (class *Classes) spec(spec ast.Spec) string {
+	s := spec.(*ast.TypeSpec)
+	switch s.Type.(type) {
+	// 構造体の場合
+	case *ast.StructType:
+		// エクスポートされていない構造体は非対象とする
+		if class.ExportOnly && s.Name.IsExported() == false {
+			return ""
+		}
+		return s.Name.String()
+	}
+	return ""
+}
